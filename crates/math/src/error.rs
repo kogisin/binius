@@ -24,8 +24,15 @@ pub enum Error {
 	ExtrapolateNumberOfEvaluations,
 	#[error("{0}")]
 	FieldError(#[from] binius_field::Error),
-	#[error("batch size mismatch - non-rectangular query shape or evals of wrong length")]
-	BatchEvaluateSizeMismatch,
+	#[error(
+		"batch evaluation expects all input slices to have the same length as the output slice;
+		at index {index}, expected length {expected}, got length {actual}"
+	)]
+	BatchEvaluateSizeMismatch {
+		index: usize,
+		expected: usize,
+		actual: usize,
+	},
 	#[error("the query must have size {expected}")]
 	IncorrectQuerySize { expected: usize },
 	#[error("Polynomial error: {0}")]
@@ -53,4 +60,6 @@ pub enum Error {
 	PiecewiseMultilinearIncompatibleEvals { actual: usize, expected: usize },
 	#[error("cannot fold a constant multilinear")]
 	ConstantFold,
+	#[error("the function expects the expression to have degree at most 1")]
+	NonLinearExpression,
 }

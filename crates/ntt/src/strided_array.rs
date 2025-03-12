@@ -14,7 +14,6 @@ pub enum Error {
 /// A mutable view of an 2D array in row-major order that allows for parallel processing of
 /// vertical slices.
 #[derive(Debug)]
-#[allow(clippy::redundant_allocation)]
 pub struct StridedArray2DViewMut<'a, T> {
 	data: &'a mut [T],
 	data_width: usize,
@@ -24,7 +23,11 @@ pub struct StridedArray2DViewMut<'a, T> {
 
 impl<'a, T> StridedArray2DViewMut<'a, T> {
 	/// Create a single-piece view of the data.
-	pub fn without_stride(data: &'a mut [T], height: usize, width: usize) -> Result<Self, Error> {
+	pub const fn without_stride(
+		data: &'a mut [T],
+		height: usize,
+		width: usize,
+	) -> Result<Self, Error> {
 		if width * height != data.len() {
 			return Err(Error::DimensionMismatch);
 		}
@@ -76,7 +79,7 @@ impl<'a, T> StridedArray2DViewMut<'a, T> {
 
 		cols.clone().step_by(stride).map(move |start| {
 			let end = (start + stride).min(cols.end);
-			StridedArray2DViewMut::<'a, T> {
+			Self {
 				// Safety: different instances of StridedArray2DViewMut created with the same data slice
 				// do not access overlapping indices.
 				data: unsafe { slice::from_raw_parts_mut(data.as_mut_ptr(), data.len()) },
@@ -99,7 +102,7 @@ impl<'a, T> StridedArray2DViewMut<'a, T> {
 			.map(move |start| {
 				let end = (start + stride).min(self.cols.end);
 				// We are setting the same lifetime as `self` captures.
-				StridedArray2DViewMut::<'a, T> {
+				Self {
 					// Safety: different instances of StridedArray2DViewMut created with the same data slice
 					// do not access overlapping indices.
 					data: unsafe {
@@ -116,8 +119,7 @@ impl<'a, T> StridedArray2DViewMut<'a, T> {
 impl<T> Index<(usize, usize)> for StridedArray2DViewMut<'_, T> {
 	type Output = T;
 
-	fn index(&self, index: (usize, usize)) -> &T {
-		let (i, j) = index;
+	fn index(&self, (i, j): (usize, usize)) -> &T {
 		assert!(i < self.height());
 		assert!(j < self.width());
 		unsafe { self.get_unchecked_ref(i, j) }
@@ -125,8 +127,7 @@ impl<T> Index<(usize, usize)> for StridedArray2DViewMut<'_, T> {
 }
 
 impl<T> IndexMut<(usize, usize)> for StridedArray2DViewMut<'_, T> {
-	fn index_mut(&mut self, index: (usize, usize)) -> &mut Self::Output {
-		let (i, j) = index;
+	fn index_mut(&mut self, (i, j): (usize, usize)) -> &mut Self::Output {
 		assert!(i < self.height());
 		assert!(j < self.width());
 		unsafe { self.get_unchecked_mut(i, j) }

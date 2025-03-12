@@ -311,19 +311,19 @@ where
 	}
 
 	#[inline]
-	fn iter(&self) -> impl Iterator<Item = Self::Scalar> + Send + '_ {
+	fn iter(&self) -> impl Iterator<Item = Self::Scalar> + Send + Clone + '_ {
 		IterationMethods::<Scalar::Underlier, U>::ref_iter(&self.0)
 			.map(|underlier| Scalar::from_underlier(underlier))
 	}
 
 	#[inline]
-	fn into_iter(self) -> impl Iterator<Item = Self::Scalar> + Send {
+	fn into_iter(self) -> impl Iterator<Item = Self::Scalar> + Send + Clone {
 		IterationMethods::<Scalar::Underlier, U>::value_iter(self.0)
 			.map(|underlier| Scalar::from_underlier(underlier))
 	}
 
 	#[inline]
-	fn iter_slice(slice: &[Self]) -> impl Iterator<Item = Self::Scalar> + Send + '_ {
+	fn iter_slice(slice: &[Self]) -> impl Iterator<Item = Self::Scalar> + Send + Clone + '_ {
 		IterationMethods::<Scalar::Underlier, U>::slice_iter(Self::to_underliers_ref(slice))
 			.map_skippable(|underlier| Scalar::from_underlier(underlier))
 	}
@@ -458,6 +458,7 @@ pub(crate) use impl_ops_for_zero_height;
 
 /// Multiply `PT1` values by upcasting to wider `PT2` type with the same scalar.
 /// This is useful for the cases when SIMD multiplication is faster.
+#[allow(dead_code)]
 pub fn mul_as_bigger_type<PT1, PT2>(lhs: PT1, rhs: PT1) -> PT1
 where
 	PT1: PackedField + WithUnderlier,
@@ -475,6 +476,7 @@ where
 
 /// Square `PT1` values by upcasting to wider `PT2` type with the same scalar.
 /// This is useful for the cases when SIMD square is faster.
+#[allow(dead_code)]
 pub fn square_as_bigger_type<PT1, PT2>(val: PT1) -> PT1
 where
 	PT1: PackedField + WithUnderlier,
@@ -491,6 +493,7 @@ where
 
 /// Invert `PT1` values by upcasting to wider `PT2` type with the same scalar.
 /// This is useful for the cases when SIMD invert is faster.
+#[allow(dead_code)]
 pub fn invert_as_bigger_type<PT1, PT2>(val: PT1) -> PT1
 where
 	PT1: PackedField + WithUnderlier,
@@ -507,6 +510,7 @@ where
 
 /// Multiply by alpha `PT1` values by upcasting to wider `PT2` type with the same scalar.
 /// This is useful for the cases when SIMD multiply by alpha is faster.
+#[allow(dead_code)]
 pub fn mul_alpha_as_bigger_type<PT1, PT2>(val: PT1) -> PT1
 where
 	PT1: PackedField + WithUnderlier,

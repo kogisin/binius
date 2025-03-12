@@ -168,7 +168,9 @@ macro_rules! benchmark_packed_operation {
             #[allow(non_snake_case)]
 			#[inline(never)]
             fn $packed_field(c: &mut criterion::Criterion) {
-                let mut group = c.benchmark_group(stringify!($packed_field:));
+                let mut group = c.benchmark_group(format!("{}/{}", stringify!($op_name), stringify!($packed_field)));
+                group.warm_up_time(core::time::Duration::from_secs(1));
+                group.measurement_time(core::time::Duration::from_secs(3));
                 group.throughput(criterion::Throughput::Elements((<$packed_field as binius_field::PackedField>::WIDTH *  $crate::packed_field_utils::BATCH_SIZE) as _));
 
                 let mut rng = rand::thread_rng();
@@ -274,23 +276,35 @@ macro_rules! benchmark_packed_operation {
 				PackedBinaryPolyval4x128b
 
 				// Byte sliced AES fields
-				ByteSlicedAES16x8b
-				ByteSlicedAES16x16b
-				ByteSlicedAES16x32b
-				ByteSlicedAES16x64b
 				ByteSlicedAES16x128b
+				ByteSlicedAES16x64b
+				ByteSlicedAES2x16x64b
+				ByteSlicedAES16x32b
+				ByteSlicedAES4x16x32b
+				ByteSlicedAES16x16b
+				ByteSlicedAES8x16x16b
+				ByteSlicedAES16x8b
+				ByteSlicedAES16x16x8b
 
-				ByteSlicedAES32x8b
-				ByteSlicedAES32x16b
-				ByteSlicedAES32x32b
-				ByteSlicedAES32x64b
 				ByteSlicedAES32x128b
+				ByteSlicedAES32x64b
+				ByteSlicedAES2x32x64b
+				ByteSlicedAES32x32b
+				ByteSlicedAES4x32x32b
+				ByteSlicedAES32x16b
+				ByteSlicedAES8x32x16b
+				ByteSlicedAES32x8b
+				ByteSlicedAES16x32x8b
 
-				ByteSlicedAES64x8b
-				ByteSlicedAES64x16b
-				ByteSlicedAES64x32b
-				ByteSlicedAES64x64b
 				ByteSlicedAES64x128b
+				ByteSlicedAES64x64b
+				ByteSlicedAES2x64x64b
+				ByteSlicedAES64x32b
+				ByteSlicedAES4x64x32b
+				ByteSlicedAES64x16b
+				ByteSlicedAES8x64x16b
+				ByteSlicedAES64x8b
+				ByteSlicedAES16x64x8b
 			]);
 	};
 }

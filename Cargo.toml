@@ -42,7 +42,7 @@ manual_clamp = "warn"
 manual_is_variant_and = "warn"
 manual_string_new = "warn"
 match_same_arms = "warn"
-missing_const_for_fn = "warn"
+missing-const-for-fn = "allow"             # TODO: https://github.com/rust-lang/rust-clippy/issues/14020
 mutex_integer = "warn"
 naive_bytecount = "warn"
 needless_bitwise_bool = "warn"
@@ -92,6 +92,7 @@ bytemuck = { version = "1.18.0", features = [
 bytes = "1.7.2"
 bytesize = "1.3.0"
 cfg-if = "1.0.0"
+concat-idents = "1.1.5"
 criterion = { version = "0.5.1" }
 derive_more = "0.99.17"
 digest = "0.10.7"

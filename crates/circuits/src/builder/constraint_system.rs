@@ -72,7 +72,7 @@ impl<'arena> ConstraintSystemBuilder<'arena> {
 		})
 	}
 
-	pub fn witness(&mut self) -> Option<&mut witness::Builder<'arena>> {
+	pub const fn witness(&mut self) -> Option<&mut witness::Builder<'arena>> {
 		self.witness.as_mut()
 	}
 
@@ -198,7 +198,7 @@ impl<'arena> ConstraintSystemBuilder<'arena> {
 		self.non_zero_oracle_ids.push(oracle_id);
 	}
 
-	pub fn add_channel(&mut self) -> ChannelId {
+	pub const fn add_channel(&mut self) -> ChannelId {
 		let channel_id = self.next_channel_id;
 		self.next_channel_id += 1;
 		channel_id
@@ -251,6 +251,19 @@ impl<'arena> ConstraintSystemBuilder<'arena> {
 			.borrow_mut()
 			.add_named(self.scoped_name(name))
 			.linear_combination_with_offset(n_vars, offset, inner)
+	}
+
+	pub fn add_composite_mle(
+		&mut self,
+		name: impl ToString,
+		n_vars: usize,
+		inner: impl IntoIterator<Item = OracleId>,
+		comp: ArithExpr<F>,
+	) -> Result<OracleId, OracleError> {
+		self.oracles
+			.borrow_mut()
+			.add_named(self.scoped_name(name))
+			.composite_mle(n_vars, inner, comp)
 	}
 
 	pub fn add_packed(
