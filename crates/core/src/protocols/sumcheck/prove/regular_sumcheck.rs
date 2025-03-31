@@ -13,13 +13,15 @@ use itertools::izip;
 use stackalloc::stackalloc_with_default;
 use tracing::instrument;
 
-use super::{batch_prove::SumcheckProver, prover_state::ProverState};
 use crate::{
 	polynomial::{ArithCircuitPoly, Error as PolynomialError, MultilinearComposite},
 	protocols::sumcheck::{
-		common::{get_nontrivial_evaluation_points, CompositeSumClaim, RoundCoeffs},
+		common::{
+			get_nontrivial_evaluation_points, interpolation_domains_for_composition_degrees,
+			CompositeSumClaim, RoundCoeffs,
+		},
 		error::Error,
-		prove::prover_state::SumcheckInterpolator,
+		prove::{MultilinearInput, ProverState, SumcheckInterpolator, SumcheckProver},
 	},
 };
 
@@ -126,16 +128,12 @@ where
 			.map(|composite_claim| composite_claim.sum)
 			.collect();
 
-		let domains = composite_claims
-			.iter()
-			.map(|composite_claim| {
-				let degree = composite_claim.composition.degree();
-				let domain =
-					evaluation_domain_factory.create_with_infinity(degree + 1, degree >= 2)?;
-				Ok(domain.into())
-			})
-			.collect::<Result<Vec<InterpolationDomain<FDomain>>, _>>()
-			.map_err(Error::MathError)?;
+		let domains = interpolation_domains_for_composition_degrees(
+			evaluation_domain_factory,
+			composite_claims
+				.iter()
+				.map(|composite_claim| composite_claim.composition.degree()),
+		)?;
 
 		let compositions = composite_claims
 			.into_iter()
@@ -144,9 +142,17 @@ where
 
 		let nontrivial_evaluation_points = get_nontrivial_evaluation_points(&domains)?;
 
+		let multilinears_input = multilinears
+			.into_iter()
+			.map(|multilinear| MultilinearInput {
+				multilinear,
+				zero_scalars_suffix: 0,
+			})
+			.collect();
+
 		let state = ProverState::new(
 			evaluation_order,
-			multilinears,
+			multilinears_input,
 			claimed_sums,
 			nontrivial_evaluation_points,
 			switchover_fn,
@@ -203,9 +209,9 @@ where
 			})
 			.collect::<Vec<_>>();
 
-		let evals = self.state.calculate_round_evals(&evaluators)?;
+		let round_evals = self.state.calculate_round_evals(&evaluators)?;
 		self.state
-			.calculate_round_coeffs_from_evals(&evaluators, batch_coeff, evals)
+			.calculate_round_coeffs_from_evals(&evaluators, batch_coeff, round_evals)
 	}
 
 	fn finish(self: Box<Self>) -> Result<Vec<F>, Error> {

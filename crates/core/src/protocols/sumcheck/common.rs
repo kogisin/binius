@@ -6,10 +6,9 @@ use binius_field::{
 	util::{inner_product_unchecked, powers},
 	ExtensionField, Field, PackedField,
 };
-use binius_math::{CompositionPoly, InterpolationDomain, MultilinearPoly};
+use binius_math::{CompositionPoly, EvaluationDomainFactory, InterpolationDomain, MultilinearPoly};
 use binius_utils::bail;
 use getset::{CopyGetters, Getters};
-use tracing::instrument;
 
 use super::error::Error;
 
@@ -242,31 +241,17 @@ pub const fn immediate_switchover_heuristic(_extension_degree: usize) -> usize {
 	0
 }
 
-/// Determine switchover rounds for a slice of multilinears.
-#[instrument(skip_all, level = "debug")]
-pub fn determine_switchovers<P, M>(
-	multilinears: &[M],
-	switchover_fn: impl Fn(usize) -> usize,
-) -> Vec<usize>
-where
-	P: PackedField,
-	M: MultilinearPoly<P>,
-{
-	// TODO: This can be computed in parallel.
-	multilinears
-		.iter()
-		.map(|multilinear| switchover_fn(1 << multilinear.log_extension_degree()))
-		.collect()
-}
-
 /// Check that all multilinears in a slice are of the same size.
-pub fn equal_n_vars_check<P, M>(multilinears: &[M]) -> Result<usize, Error>
+pub fn equal_n_vars_check<'a, P, M>(
+	multilinears: impl IntoIterator<Item = &'a M>,
+) -> Result<usize, Error>
 where
 	P: PackedField,
-	M: MultilinearPoly<P>,
+	M: MultilinearPoly<P> + 'a,
 {
+	let mut multilinears = multilinears.into_iter();
 	let n_vars = multilinears
-		.first()
+		.next()
 		.map(|multilinear| multilinear.n_vars())
 		.unwrap_or_default();
 	for multilinear in multilinears {
@@ -301,6 +286,20 @@ where
 pub fn batch_weighted_value<F: Field>(batch_coeff: F, values: impl Iterator<Item = F>) -> F {
 	// Multiplying by batch_coeff is important for security!
 	batch_coeff * inner_product_unchecked(powers(batch_coeff), values)
+}
+
+/// Create interpolation domains for a sequence of composition degrees.
+pub fn interpolation_domains_for_composition_degrees<FDomain>(
+	evaluation_domain_factory: impl EvaluationDomainFactory<FDomain>,
+	degrees: impl IntoIterator<Item = usize>,
+) -> Result<Vec<InterpolationDomain<FDomain>>, Error>
+where
+	FDomain: Field,
+{
+	degrees
+		.into_iter()
+		.map(|degree| Ok(evaluation_domain_factory.create(degree + 1)?.into()))
+		.collect()
 }
 
 /// Validate the sumcheck evaluation domains to conform to the shape expected by the

@@ -7,12 +7,10 @@ use binius_field::{
 	arch::OptimalUnderlier, as_packed_field::PackedType, BinaryField1b, BinaryField8b,
 };
 use binius_hal::make_portable_backend;
-use binius_hash::compress::Groestl256ByteCompression;
-use binius_math::DefaultEvaluationDomainFactory;
+use binius_hash::groestl::{Groestl256, Groestl256ByteCompression};
 use binius_utils::{checked_arithmetics::log2_ceil_usize, rayon::adjust_thread_pool};
 use bytesize::ByteSize;
 use clap::{value_parser, Parser};
-use groestl_crypto::Groestl256;
 use tracing_profile::init_tracing;
 
 const MIN_N_ADDITIONS: usize = 1 << (PackedType::<OptimalUnderlier, BinaryField1b>::LOG_WIDTH);
@@ -69,26 +67,17 @@ fn main() -> Result<()> {
 		.expect("builder created with witness");
 	let constraint_system = builder.build()?;
 
-	let domain_factory = DefaultEvaluationDomainFactory::default();
 	let backend = make_portable_backend();
 
-	let proof = constraint_system::prove::<
-		U,
-		CanonicalTowerFamily,
-		_,
-		Groestl256,
-		Groestl256ByteCompression,
-		HasherChallenger<Groestl256>,
-		_,
-	>(
-		&constraint_system,
-		args.log_inv_rate as usize,
-		SECURITY_BITS,
-		&[],
-		witness,
-		&domain_factory,
-		&backend,
-	)?;
+	let proof =
+		constraint_system::prove::<
+			U,
+			CanonicalTowerFamily,
+			Groestl256,
+			Groestl256ByteCompression,
+			HasherChallenger<Groestl256>,
+			_,
+		>(&constraint_system, args.log_inv_rate as usize, SECURITY_BITS, &[], witness, &backend)?;
 
 	println!("Proof size: {}", ByteSize::b(proof.get_proof_size() as u64));
 

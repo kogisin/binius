@@ -8,26 +8,30 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-binius_field = { path = "../field" }
-binius_utils = { path = "../utils", default-features = false }
+binius_field = { path = "../field", default-features = false }
+binius_maybe_rayon = { path = "../maybe_rayon", default-features = false }
 binius_ntt = { path = "../ntt" }
+binius_utils = { path = "../utils", default-features = false }
 bytemuck.workspace = true
 bytes.workspace = true
 cfg-if.workspace = true
 digest.workspace = true
-groestl_crypto.workspace = true
 itertools.workspace = true
 lazy_static.workspace = true
 sha2 = { workspace = true, features = ["compress"] }
+stackalloc.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+groestl_crypto.workspace = true
 hex-literal.workspace = true
+proptest.workspace = true
 rand = { workspace = true, features = ["std", "std_rng"] }
 
 [features]
-stable_only = ["binius_utils/stable_only", "binius_field/stable_only"]
+default = ["nightly_features"]
+nightly_features = ["binius_field/nightly_features"]
 
 [lib]
 bench = false

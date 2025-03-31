@@ -10,8 +10,6 @@ pub enum Error {
 	MatrixNotSquare,
 	#[error("the matrix is singular")]
 	MatrixIsSingular,
-	#[error("domain size needs to be at least one")]
-	DomainSizeAtLeastOne,
 	#[error("domain size is larger than the field")]
 	DomainSizeTooLarge,
 	#[error("the inputted packed values slice had an unexpected length")]
@@ -35,6 +33,8 @@ pub enum Error {
 	},
 	#[error("the query must have size {expected}")]
 	IncorrectQuerySize { expected: usize },
+	#[error("the nonzero scalar prefix should be at most {expected}")]
+	IncorrectNonzeroScalarPrefix { expected: usize },
 	#[error("Polynomial error: {0}")]
 	PolynomialError(Box<dyn std::error::Error + Send + Sync>),
 	#[error("MultilinearQuery is full, cannot update further. Has {max_query_vars} variables")]

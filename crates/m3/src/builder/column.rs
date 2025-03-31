@@ -1,8 +1,8 @@
 // Copyright 2025 Irreducible Inc.
 
-use std::marker::PhantomData;
+use std::{marker::PhantomData, sync::Arc};
 
-use binius_core::oracle::ShiftVariant;
+use binius_core::{oracle::ShiftVariant, polynomial::MultivariatePoly};
 use binius_field::{ExtensionField, TowerField};
 use binius_math::ArithExpr;
 
@@ -20,7 +20,7 @@ pub type ColumnPartitionIndex = usize;
 /// from the canonical tower (B1, B8, B16, B32, B64, B128). The second constant represents how many
 /// elements are packed vertically into a single logical row. For example, a column of type
 /// `Col<B1, 32>` will have 2^5 = 32 elements of `B1` packed into a single row.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Col<F: TowerField, const VALUES_PER_ROW: usize = 1> {
 	pub table_id: TableId,
 	pub table_index: TableId,
@@ -56,10 +56,8 @@ impl<F: TowerField, const VALUES_PER_ROW: usize> Col<F, VALUES_PER_ROW> {
 	}
 }
 
-/// Upcast a columns from a subfield to an extension field..
-pub fn upcast_col<F, FSub, const VALUES_PER_ROW: usize>(
-	col: Col<FSub, VALUES_PER_ROW>,
-) -> Col<F, VALUES_PER_ROW>
+/// Upcast a column from a subfield to an extension field..
+pub fn upcast_col<F, FSub, const V: usize>(col: Col<FSub, V>) -> Col<F, V>
 where
 	FSub: TowerField,
 	F: TowerField + ExtensionField<FSub>,
@@ -99,6 +97,12 @@ pub struct ColumnShape {
 	pub log_values_per_row: usize,
 }
 
+impl ColumnShape {
+	pub fn log_cell_size(&self) -> usize {
+		self.tower_height + self.log_values_per_row
+	}
+}
+
 /// Unique identifier for a column within a constraint system.
 ///
 /// IDs are assigned when columns are added to the constraint system and remain stable when more
@@ -114,10 +118,6 @@ pub struct ColumnId {
 pub enum ColumnDef<F: TowerField = B128> {
 	Committed {
 		tower_level: usize,
-	},
-	LinearCombination {
-		offset: F,
-		col_scalars: Vec<(ColumnIndex, F)>,
 	},
 	Selected {
 		col: ColumnId,
@@ -137,5 +137,8 @@ pub enum ColumnDef<F: TowerField = B128> {
 	Computed {
 		cols: Vec<ColumnIndex>,
 		expr: ArithExpr<F>,
+	},
+	Constant {
+		poly: Arc<dyn MultivariatePoly<F>>,
 	},
 }
