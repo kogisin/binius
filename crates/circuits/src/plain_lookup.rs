@@ -3,11 +3,14 @@
 use std::{cmp::Reverse, fmt::Debug, hash::Hash};
 
 use anyhow::{ensure, Result};
-use binius_core::{constraint_system::channel::FlushDirection, oracle::OracleId};
+use binius_core::{
+	constraint_system::channel::{FlushDirection, OracleOrConst},
+	oracle::OracleId,
+};
 use binius_field::{
-	as_packed_field::{PackScalar, PackedType},
-	packed::set_packed_slice,
-	BinaryField1b, ExtensionField, Field, PackedFieldIndexable, TowerField,
+	as_packed_field::PackScalar,
+	packed::{get_packed_slice, set_packed_slice},
+	BinaryField1b, ExtensionField, Field, PackedField, TowerField,
 };
 use bytemuck::Pod;
 use itertools::izip;
@@ -63,7 +66,6 @@ where
 	U: PackScalar<FTable> + Pod,
 	F: ExtensionField<FTable>,
 	FTable: TowerField,
-	PackedType<U, FTable>: PackedFieldIndexable,
 {
 	ensure!(n_lookups.len() == lookups_u.len(), "n_vars and lookups_u must be of the same length");
 	ensure!(
@@ -127,15 +129,16 @@ where
 		}
 
 		for (&permuted, &original) in izip!(&permuted_lookup_t, lookup_t.as_ref()) {
-			let original_slice =
-				PackedType::<U, FTable>::unpack_scalars(witness.get::<FTable>(original)?.packed());
+			let original_slice = witness.get::<FTable>(original)?.packed();
 
 			let mut permuted_column = witness.new_column::<FTable>(permuted);
-			let permuted_slice =
-				PackedType::<U, FTable>::unpack_scalars_mut(permuted_column.packed());
+			let permuted_slice = permuted_column.packed();
 
-			for (&(index, _), permuted) in izip!(&indexed_multiplicities, permuted_slice) {
-				*permuted = original_slice[index];
+			let mut iterator = indexed_multiplicities
+				.iter()
+				.map(|&(index, _)| get_packed_slice(original_slice, index));
+			for v in permuted_slice.iter_mut() {
+				*v = PackedField::from_scalars(&mut iterator);
 			}
 		}
 	}
@@ -143,11 +146,23 @@ where
 	let permutation_channel = builder.add_channel();
 	let multiplicity_channel = builder.add_channel();
 
-	builder.send(permutation_channel, 1 << t_log_rows, permuted_lookup_t.iter().copied())?;
-	builder.receive(permutation_channel, 1 << t_log_rows, lookup_t.as_ref().iter().copied())?;
+	builder.send(
+		permutation_channel,
+		1 << t_log_rows,
+		permuted_lookup_t.iter().copied().map(OracleOrConst::Oracle),
+	)?;
+	builder.receive(
+		permutation_channel,
+		1 << t_log_rows,
+		lookup_t.as_ref().iter().copied().map(OracleOrConst::Oracle),
+	)?;
 
 	for (lookup_u, &count) in izip!(lookups_u, n_lookups) {
-		builder.send(multiplicity_channel, count, lookup_u.as_ref().iter().copied())?;
+		builder.send(
+			multiplicity_channel,
+			count,
+			lookup_u.as_ref().iter().copied().map(OracleOrConst::Oracle),
+		)?;
 	}
 
 	for (i, bit) in bits.into_iter().enumerate() {
@@ -155,7 +170,7 @@ where
 			FlushDirection::Pull,
 			multiplicity_channel,
 			bit,
-			permuted_lookup_t.iter().copied(),
+			permuted_lookup_t.iter().copied().map(OracleOrConst::Oracle),
 			1 << i,
 		)?
 	}
@@ -168,7 +183,7 @@ where
 #[cfg(test)]
 pub mod test_plain_lookup {
 	use binius_field::BinaryField32b;
-	use binius_maybe_rayon::prelude::*;
+	use rand::{rngs::StdRng, SeedableRng};
 
 	use super::*;
 	use crate::transparent;
@@ -190,13 +205,13 @@ pub mod test_plain_lookup {
 
 	fn generate_random_u8_mul_claims(vals: &mut [u32]) {
 		use rand::Rng;
-		vals.par_iter_mut().for_each(|val| {
-			let mut rng = rand::thread_rng();
+		let mut rng = StdRng::seed_from_u64(0);
+		for val in vals {
 			let x = rng.gen_range(0..=255u8);
 			let y = rng.gen_range(0..=255u8);
 			let product = x as u16 * y as u16;
 			*val = into_lookup_claim(x, y, product);
-		});
+		}
 	}
 
 	pub fn test_u8_mul_lookup<const LOG_MAX_MULTIPLICITY: usize>(

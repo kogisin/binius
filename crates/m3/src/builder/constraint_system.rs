@@ -4,17 +4,18 @@ pub use binius_core::constraint_system::channel::{
 	Boundary, Flush as CompiledFlush, FlushDirection,
 };
 use binius_core::{
-	constraint_system::{channel::ChannelId, ConstraintSystem as CompiledConstraintSystem},
-	oracle::{
-		Constraint, ConstraintPredicate, ConstraintSet, MultilinearOracleSet, OracleId,
-		ProjectionVariant,
+	constraint_system::{
+		channel::{ChannelId, OracleOrConst},
+		ConstraintSystem as CompiledConstraintSystem,
 	},
+	oracle::{Constraint, ConstraintPredicate, ConstraintSet, MultilinearOracleSet, OracleId},
 	transparent::step_down::StepDown,
 };
-use binius_field::{underlier::UnderlierType, TowerField};
+use binius_field::{PackedField, TowerField};
 use binius_math::LinearNormalForm;
-use binius_utils::checked_arithmetics::{log2_ceil_usize, log2_strict_usize};
+use binius_utils::checked_arithmetics::log2_strict_usize;
 use bumpalo::Bump;
+use itertools::chain;
 
 use super::{
 	channel::{Channel, Flush},
@@ -23,7 +24,7 @@ use super::{
 	statement::Statement,
 	table::TablePartition,
 	types::B128,
-	witness::{TableWitnessIndex, WitnessIndex},
+	witness::WitnessIndex,
 	Table, TableBuilder,
 };
 use crate::builder::expr::ArithExprNamedVars;
@@ -146,25 +147,14 @@ impl<F: TowerField> ConstraintSystem<F> {
 		id
 	}
 
-	/// Creates and allocates the witness index for a statement.
+	/// Creates and allocates the witness index.
 	///
-	/// The statement includes information about the tables sizes, which this requires in order to
-	/// allocate the column data correctly. The created witness index needs to be populated before
-	/// proving.
-	pub fn build_witness<'cs, 'alloc, U: UnderlierType>(
+	/// **Deprecated**: This is a thin wrapper over [`WitnessIndex::new`] now, which is preferred.
+	pub fn build_witness<'cs, 'alloc, P: PackedField<Scalar = F>>(
 		&'cs self,
 		allocator: &'alloc Bump,
-		statement: &Statement,
-	) -> Result<WitnessIndex<'cs, 'alloc, U, F>, Error> {
-		Ok(WitnessIndex {
-			tables: self
-				.tables
-				.iter()
-				.map(|table| {
-					TableWitnessIndex::new(allocator, table, statement.table_sizes[table.id])
-				})
-				.collect(),
-		})
+	) -> WitnessIndex<'cs, 'alloc, P> {
+		WitnessIndex::new(self, allocator)
 	}
 
 	/// Compiles a [`CompiledConstraintSystem`] for a particular statement.
@@ -181,7 +171,6 @@ impl<F: TowerField> ConstraintSystem<F> {
 			});
 		}
 
-		// TODO: new -> with_capacity
 		let mut oracles = MultilinearOracleSet::new();
 		let mut table_constraints = Vec::new();
 		let mut compiled_flushes = Vec::new();
@@ -191,6 +180,13 @@ impl<F: TowerField> ConstraintSystem<F> {
 			if count == 0 {
 				continue;
 			}
+			if table.power_of_two_sized && !count.is_power_of_two() {
+				return Err(Error::TableSizePowerOfTwoRequired {
+					table_id: table.id,
+					size: count,
+				});
+			}
+
 			let mut oracle_lookup = Vec::new();
 
 			let mut transparent_single = vec![None; table.columns.len()];
@@ -204,8 +200,9 @@ impl<F: TowerField> ConstraintSystem<F> {
 			}
 
 			// Add multilinear oracles for all table columns.
+			let log_capacity = table.log_capacity(count);
 			for column_info in table.columns.iter() {
-				let n_vars = log2_ceil_usize(count) + column_info.shape.log_values_per_row;
+				let n_vars = log_capacity + column_info.shape.log_values_per_row;
 				let oracle_id = add_oracle_for_column(
 					&mut oracles,
 					&oracle_lookup,
@@ -228,7 +225,7 @@ impl<F: TowerField> ConstraintSystem<F> {
 					..
 				} = partition;
 
-				let n_vars = log2_ceil_usize(count) + log2_strict_usize(*values_per_row);
+				let n_vars = log_capacity + log2_strict_usize(*values_per_row);
 
 				let partition_oracle_ids = columns
 					.iter()
@@ -236,27 +233,42 @@ impl<F: TowerField> ConstraintSystem<F> {
 					.collect::<Vec<_>>();
 
 				// StepDown witness data is populated in WitnessIndex::into_multilinear_extension_index
-				let step_down =
-					oracles.add_transparent(StepDown::new(n_vars, count * values_per_row)?)?;
+				let step_down = (!table.power_of_two_sized)
+					.then(|| {
+						let step_down_poly = StepDown::new(n_vars, count * values_per_row)?;
+						oracles.add_transparent(step_down_poly)
+					})
+					.transpose()?;
 
 				// Translate flushes for the compiled constraint system.
 				for Flush {
 					column_indices,
 					channel_id,
 					direction,
+					multiplicity,
 					selector,
 				} in flushes
 				{
 					let flush_oracles = column_indices
 						.iter()
-						.map(|&column_index| oracle_lookup[column_index])
+						.map(|&column_index| OracleOrConst::Oracle(oracle_lookup[column_index]))
 						.collect::<Vec<_>>();
+					let mut selectors =
+						chain!(selector.map(|column_idx| oracle_lookup[column_idx]), step_down)
+							.collect::<Vec<_>>();
+					if selectors.len() > 1 {
+						unimplemented!(
+							"Multiple selectors are not supported yet. \
+							Custom selectors are only allowed on tables with power-of-two size."
+						);
+					}
+					let selector = selectors.pop();
 					compiled_flushes.push(CompiledFlush {
 						oracles: flush_oracles,
 						channel_id: *channel_id,
 						direction: *direction,
-						selector: selector.unwrap_or(step_down),
-						multiplicity: 1,
+						selector,
+						multiplicity: *multiplicity as u64,
 					});
 				}
 
@@ -330,11 +342,24 @@ fn add_oracle_for_column<F: TowerField>(
 					}
 				})
 				.collect();
-			addition.projected(
-				oracle_lookup[col.table_index],
-				index_values,
-				ProjectionVariant::FirstVars,
-			)?
+			addition.projected(oracle_lookup[col.table_index], index_values, 0)?
+		}
+		ColumnDef::Projected {
+			col,
+			start_index,
+			query_size,
+			query_bits,
+		} => {
+			let query_values = (0..*query_size)
+				.map(|i| -> F {
+					if (query_bits >> i) & 1 == 0 {
+						F::ZERO
+					} else {
+						F::ONE
+					}
+				})
+				.collect();
+			addition.projected(oracle_lookup[col.table_index], query_values, *start_index)?
 		}
 		ColumnDef::Shifted {
 			col,
@@ -375,4 +400,24 @@ fn add_oracle_for_column<F: TowerField>(
 		)?,
 	};
 	Ok(oracle_id)
+}
+
+#[cfg(test)]
+mod tests {
+	use assert_matches::assert_matches;
+
+	use super::*;
+
+	#[test]
+	fn test_unsatisfied_po2_requirement() {
+		let mut cs = ConstraintSystem::<B128>::new();
+		let mut table_builder = cs.add_table("fibonacci");
+		table_builder.require_power_of_two_size();
+
+		let statement = Statement {
+			boundaries: vec![],
+			table_sizes: vec![15],
+		};
+		assert_matches!(cs.compile(&statement), Err(Error::TableSizePowerOfTwoRequired { .. }));
+	}
 }

@@ -27,7 +27,10 @@ use crate::{
 	merkle_tree::{BinaryMerkleTreeProver, MerkleTreeProver, MerkleTreeScheme},
 	oracle::{MultilinearOracleSet, MultilinearPolyVariant, OracleId},
 	piop,
-	protocols::{evalcheck::EvalcheckMultilinearClaim, fri::CommitOutput},
+	protocols::{
+		evalcheck::{subclaims::MemoizedData, EvalcheckMultilinearClaim},
+		fri::CommitOutput,
+	},
 	ring_switch::prove::ReducedWitness,
 	tower::{CanonicalTowerFamily, PackedTop, TowerFamily, TowerUnderlier},
 	transcript::ProverTranscript,
@@ -48,7 +51,7 @@ where
 	FExt: ExtensionField<F>,
 {
 	let data = repeat_with(|| <PackedType<U, F>>::random(&mut rng))
-		.take(1 << (n_vars - <PackedType<U, F>>::LOG_WIDTH))
+		.take(1 << n_vars.saturating_sub(<PackedType<U, F>>::LOG_WIDTH))
 		.collect::<Vec<_>>();
 	let mle = MultilinearExtension::new(n_vars, data).unwrap();
 	MLEEmbeddingAdapter::from(mle).upcast_arc_dyn()
@@ -57,7 +60,7 @@ where
 fn generate_multilinears<U, Tower>(
 	mut rng: impl Rng,
 	oracles: &MultilinearOracleSet<FExt<Tower>>,
-) -> MultilinearExtensionIndex<U, FExt<Tower>>
+) -> MultilinearExtensionIndex<PackedType<U, FExt<Tower>>>
 where
 	U: TowerUnderlier<Tower>,
 	Tower: TowerFamily,
@@ -92,7 +95,7 @@ fn random_eval_point<F: Field>(mut rng: impl Rng, n_vars: usize) -> Vec<F> {
 fn make_eval_claim<U, F>(
 	oracle_id: OracleId,
 	eval_point: Vec<F>,
-	witness_index: &MultilinearExtensionIndex<U, F>,
+	witness_index: &MultilinearExtensionIndex<PackedType<U, F>>,
 ) -> EvalcheckMultilinearClaim<F>
 where
 	U: UnderlierType + PackScalar<F>,
@@ -114,20 +117,23 @@ fn check_eval_point_consistency<F: Field>(system: &EvalClaimSystem<F>) {
 		let prefix_desc = &system.prefix_descs[prefix_desc_idx];
 		let suffix_desc = &system.suffix_descs[claim_desc.suffix_desc_idx];
 		assert_eq!(prefix_desc.kappa(), suffix_desc.kappa);
-		assert_eq!(
-			[prefix_desc.prefix.clone(), suffix_desc.suffix.to_vec()].concat(),
-			system.sumcheck_claim_descs[i]
-				.eval_claim
-				.eval_point
-				.to_vec()
-		);
+
+		let eval_point = &*system.sumcheck_claim_descs[i].eval_claim.eval_point;
+		if suffix_desc.suffix.is_empty() {
+			assert_eq!(&prefix_desc.prefix[..eval_point.len()], eval_point);
+		} else {
+			assert_eq!(
+				&[prefix_desc.prefix.clone(), suffix_desc.suffix.to_vec()].concat(),
+				eval_point
+			);
+		}
 	}
 }
 
 fn setup_test_eval_claims<U, F>(
 	mut rng: impl Rng,
 	oracles: &MultilinearOracleSet<F>,
-	witness_index: &MultilinearExtensionIndex<U, F>,
+	witness_index: &MultilinearExtensionIndex<PackedType<U, F>>,
 ) -> Vec<EvalcheckMultilinearClaim<F>>
 where
 	U: UnderlierType + PackScalar<F>,
@@ -154,19 +160,19 @@ where
 				Ordering::Less => {
 					// Create both back-loaded and front-loaded claims to test both shared prefixes
 					// and suffixes.
-					eval_claims.push(make_eval_claim(
+					eval_claims.push(make_eval_claim::<U, F>(
 						oracle.id(),
 						eval_point[..oracle.n_vars()].to_vec(),
 						witness_index,
 					));
-					eval_claims.push(make_eval_claim(
+					eval_claims.push(make_eval_claim::<U, F>(
 						oracle.id(),
 						eval_point[eval_point.len() - oracle.n_vars()..].to_vec(),
 						witness_index,
 					));
 				}
 				Ordering::Equal => {
-					eval_claims.push(make_eval_claim(
+					eval_claims.push(make_eval_claim::<U, F>(
 						oracle.id(),
 						eval_point.clone(),
 						witness_index,
@@ -195,7 +201,7 @@ fn with_test_instance_from_oracles<U, Tower, R>(
 	let (commit_meta, oracle_to_commit_index) = piop::make_oracle_commit_meta(oracles).unwrap();
 
 	let witness_index = generate_multilinears::<U, Tower>(&mut rng, oracles);
-	let witnesses = piop::collect_committed_witnesses(
+	let witnesses = piop::collect_committed_witnesses::<U, Tower::B128>(
 		&commit_meta,
 		&oracle_to_commit_index,
 		oracles,
@@ -203,7 +209,7 @@ fn with_test_instance_from_oracles<U, Tower, R>(
 	)
 	.unwrap();
 
-	let eval_claims = setup_test_eval_claims(&mut rng, oracles, &witness_index);
+	let eval_claims = setup_test_eval_claims::<U, Tower::B128>(&mut rng, oracles, &witness_index);
 
 	// Finish setting up the test case
 	let system =
@@ -221,6 +227,8 @@ fn make_test_oracle_set<F: TowerField>() -> MultilinearOracleSet<F> {
 	oracles.add_committed(10, 3);
 	oracles.add_committed(8, 3);
 	oracles.add_committed(8, 5);
+	oracles.add_committed(4, 3); // data is exactly one packed field element
+	oracles.add_committed(2, 3); // data is less than one packed field element
 	oracles.add_committed(10, 5);
 	oracles
 }
@@ -240,7 +248,14 @@ fn test_prove_verify_claim_reduction_with_naive_validation() {
 		let ReducedWitness {
 			transparents: transparent_witnesses,
 			sumcheck_claims: prover_sumcheck_claims,
-		} = prove::<_, _, _, Tower, _, _>(&system, &witnesses, &mut proof, &backend).unwrap();
+		} = prove::<_, _, _, Tower, _, _>(
+			&system,
+			&witnesses,
+			&mut proof,
+			MemoizedData::new(),
+			&backend,
+		)
+		.unwrap();
 
 		let mut proof = proof.into_verifier();
 		let ReducedClaim {
@@ -285,7 +300,7 @@ fn commit_prove_verify_piop<U, Tower, MTScheme, MTProver>(
 	.unwrap();
 
 	let witness_index = generate_multilinears::<U, Tower>(&mut rng, oracles);
-	let committed_multilins = piop::collect_committed_witnesses(
+	let committed_multilins = piop::collect_committed_witnesses::<U, FExt<Tower>>(
 		&commit_meta,
 		&oracle_to_commit_index,
 		oracles,
@@ -299,7 +314,7 @@ fn commit_prove_verify_piop<U, Tower, MTScheme, MTProver>(
 		codeword,
 	} = piop::commit(&fri_params, merkle_prover, &committed_multilins).unwrap();
 
-	let eval_claims = setup_test_eval_claims(&mut rng, oracles, &witness_index);
+	let eval_claims = setup_test_eval_claims::<U, FExt<Tower>>(&mut rng, oracles, &witness_index);
 
 	// Finish setting up the test case
 	let system =
@@ -313,7 +328,14 @@ fn commit_prove_verify_piop<U, Tower, MTScheme, MTProver>(
 	let ReducedWitness {
 		transparents: transparent_multilins,
 		sumcheck_claims,
-	} = prove::<_, _, _, Tower, _, _>(&system, &committed_multilins, &mut proof, &backend).unwrap();
+	} = prove::<_, _, _, Tower, _, _>(
+		&system,
+		&committed_multilins,
+		&mut proof,
+		MemoizedData::new(),
+		&backend,
+	)
+	.unwrap();
 
 	let domain_factory = DefaultEvaluationDomainFactory::<Tower::B8>::default();
 	piop::prove(

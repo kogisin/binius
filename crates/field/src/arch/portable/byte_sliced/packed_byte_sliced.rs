@@ -12,16 +12,18 @@ use bytemuck::{Pod, Zeroable};
 
 use super::{invert::invert_or_zero, multiply::mul, square::square};
 use crate::{
-	as_packed_field::PackScalar,
+	arch::byte_sliced::underlier::ByteSlicedUnderlier,
+	as_packed_field::{PackScalar, PackedType},
 	binary_field::BinaryField,
 	linear_transformation::{
-		FieldLinearTransformation, PackedTransformationFactory, Transformation,
+		FieldLinearTransformation, IDTransformation, PackedTransformationFactory, Transformation,
 	},
 	packed_aes_field::PackedAESBinaryField32x8b,
 	tower_levels::{TowerLevel, TowerLevel1, TowerLevel16, TowerLevel2, TowerLevel4, TowerLevel8},
 	underlier::{UnderlierWithBitOps, WithUnderlier},
 	AESTowerField128b, AESTowerField16b, AESTowerField32b, AESTowerField64b, AESTowerField8b,
-	ExtensionField, PackedAESBinaryField16x8b, PackedAESBinaryField64x8b, PackedExtension,
+	BinaryField1b, ExtensionField, PackedAESBinaryField16x8b, PackedAESBinaryField64x8b,
+	PackedBinaryField128x1b, PackedBinaryField256x1b, PackedBinaryField512x1b, PackedExtension,
 	PackedField,
 };
 
@@ -183,17 +185,32 @@ macro_rules! define_byte_sliced_3d {
 				Self { data }
 			}
 
+			impl_init_with_transpose!($packed_storage, $scalar_type, $storage_tower_level);
+
+			// Transposing values first is faster. Also we know that the scalar is at least 8b,
+			// so we can cast the transposed array to the array of scalars.
 			#[inline]
-			fn from_fn(mut f: impl FnMut(usize) -> Self::Scalar) -> Self {
-				let mut result = Self::default();
+			fn iter(&self) -> impl Iterator<Item = Self::Scalar> + Clone + Send + '_ {
+				type TransposePacked = <<$packed_storage as WithUnderlier>::Underlier as PackScalar<$scalar_type>>::Packed;
 
-				// TODO: use transposition here as soon as implemented
-				for i in 0..Self::WIDTH {
-					//SAFETY: i doesn't exceed Self::WIDTH
-					unsafe { result.set_unchecked(i, f(i)) };
-				}
+				let mut data: [TransposePacked; Self::HEIGHT_BYTES] = bytemuck::must_cast(self.data);
+				let mut underliers = WithUnderlier::to_underliers_arr_ref_mut(&mut data);
+				UnderlierWithBitOps::transpose_bytes_from_byte_sliced::<$storage_tower_level>(&mut underliers);
 
-				result
+				let data: [Self::Scalar; {Self::WIDTH}] = bytemuck::must_cast(data);
+				data.into_iter()
+			}
+
+			#[inline]
+			fn into_iter(self) -> impl Iterator<Item = Self::Scalar> + Clone + Send {
+				type TransposePacked = <<$packed_storage as WithUnderlier>::Underlier as PackScalar<$scalar_type>>::Packed;
+
+				let mut data: [TransposePacked; Self::HEIGHT_BYTES] = bytemuck::must_cast(self.data);
+				let mut underliers = WithUnderlier::to_underliers_arr_ref_mut(&mut data);
+				UnderlierWithBitOps::transpose_bytes_from_byte_sliced::<$storage_tower_level>(&mut underliers);
+
+				let data: [Self::Scalar; {Self::WIDTH}] = bytemuck::must_cast(data);
+				data.into_iter()
 			}
 
 			#[inline]
@@ -244,41 +261,16 @@ macro_rules! define_byte_sliced_3d {
 
 			#[inline]
 			fn unzip(self, other: Self, log_block_len: usize) -> (Self, Self) {
-				let mut result1 = Self::default();
-				let mut result2 = Self::default();
+				let (result1, result2) = unzip_byte_sliced::<$packed_storage, {Self::HEIGHT_BYTES}, {Self::SCALAR_BYTES}>(bytemuck::must_cast_ref(&self.data), bytemuck::must_cast_ref(&other.data), log_block_len + checked_log_2(Self::SCALAR_BYTES));
 
-				if log_block_len < Self::LOG_HEIGHT {
-					let block_size = 1 << log_block_len;
-					let half = Self::HEIGHT / 2;
-					for block_offset in (0..half).step_by(block_size) {
-						let target_offset = block_offset * 2;
-
-						result1.data[block_offset..block_offset + block_size]
-							.copy_from_slice(&self.data[target_offset..target_offset + block_size]);
-						result1.data[half + target_offset..half + target_offset + block_size]
-							.copy_from_slice(
-								&other.data[target_offset..target_offset + block_size],
-							);
-
-						result2.data[block_offset..block_offset + block_size].copy_from_slice(
-							&self.data[target_offset + block_size..target_offset + 2 * block_size],
-						);
-						result2.data[half + target_offset..half + target_offset + block_size]
-							.copy_from_slice(
-								&other.data
-									[target_offset + block_size..target_offset + 2 * block_size],
-							);
-					}
-				} else {
-					for i in 0..Self::HEIGHT {
-						for j in 0..Self::SCALAR_BYTES {
-							(result1.data[i][j], result2.data[i][j]) =
-								self.data[i][j].unzip(other.data[i][j], log_block_len - Self::LOG_HEIGHT);
-						}
-					}
-				}
-
-				(result1, result2)
+				(
+					Self {
+						data: bytemuck::must_cast(result1),
+					},
+					Self {
+						data: bytemuck::must_cast(result2),
+					},
+				)
 			}
 		}
 
@@ -301,6 +293,123 @@ macro_rules! define_byte_sliced_3d {
 			}
 		}
 
+		impl Add for $name {
+			type Output = Self;
+
+			#[inline]
+			fn add(self, rhs: Self) -> Self {
+				Self {
+					data: array::from_fn(|byte_number| {
+						array::from_fn(|column|
+							self.data[byte_number][column] + rhs.data[byte_number][column]
+						)
+					}),
+				}
+			}
+		}
+
+		impl AddAssign for $name {
+			#[inline]
+			fn add_assign(&mut self, rhs: Self) {
+				for (data, rhs) in zip(&mut self.data, &rhs.data) {
+					for (data, rhs) in zip(data, rhs) {
+						*data += *rhs
+					}
+				}
+			}
+		}
+
+		byte_sliced_common!($name, $packed_storage, $scalar_type, $storage_tower_level);
+
+		impl<Inner: Transformation<$packed_storage, $packed_storage>> Transformation<$name, $name> for TransformationWrapperNxN<Inner, {<$scalar_tower_level as TowerLevel>::WIDTH}> {
+			fn transform(&self, data: &$name) -> $name {
+				let mut result = <$name>::default();
+
+				for row in 0..<$name>::SCALAR_BYTES {
+					for col in 0..<$name>::SCALAR_BYTES {
+						let transformation = &self.0[col][row];
+
+						for i in 0..<$name>::HEIGHT {
+							result.data[i][row] += transformation.transform(&data.data[i][col]);
+						}
+					}
+				}
+
+				result
+			}
+		}
+
+		impl PackedTransformationFactory<$name> for $name {
+			type PackedTransformation<Data: AsRef<[<$name as PackedField>::Scalar]> + Sync> = TransformationWrapperNxN<<$packed_storage as  PackedTransformationFactory<$packed_storage>>::PackedTransformation::<[AESTowerField8b; 8]>, {<$scalar_tower_level as TowerLevel>::WIDTH}>;
+
+			fn make_packed_transformation<Data: AsRef<[<$name as PackedField>::Scalar]> + Sync>(
+				transformation: FieldLinearTransformation<<$name as PackedField>::Scalar, Data>,
+			) -> Self::PackedTransformation<Data> {
+				let transformations_8b = array::from_fn(|row| {
+					array::from_fn(|col| {
+						let row = row * 8;
+						let linear_transformation_8b = array::from_fn::<_, 8, _>(|row_8b| unsafe {
+							<<$name as PackedField>::Scalar as ExtensionField<AESTowerField8b>>::get_base_unchecked(&transformation.bases()[row + row_8b], col)
+						});
+
+						<$packed_storage as PackedTransformationFactory<$packed_storage
+						>>::make_packed_transformation(FieldLinearTransformation::new(linear_transformation_8b))
+					})
+				});
+
+				TransformationWrapperNxN(transformations_8b)
+			}
+		}
+	};
+}
+
+/// This macro implements the `from_fn` and `from_scalars` methods for byte-sliced packed fields
+/// using transpose operations. This is faster both for 1b and non-1b scalars.
+macro_rules! impl_init_with_transpose {
+	($packed_storage:ty, $scalar_type:ty, $storage_tower_level:ty) => {
+		#[inline]
+		fn from_fn(mut f: impl FnMut(usize) -> Self::Scalar) -> Self {
+			type TransposePacked =
+				<<$packed_storage as WithUnderlier>::Underlier as PackScalar<$scalar_type>>::Packed;
+
+			let mut data: [TransposePacked; Self::HEIGHT_BYTES] = array::from_fn(|i| {
+				PackedField::from_fn(|j| f((i << TransposePacked::LOG_WIDTH) + j))
+			});
+			let mut underliers = WithUnderlier::to_underliers_arr_ref_mut(&mut data);
+			UnderlierWithBitOps::transpose_bytes_to_byte_sliced::<$storage_tower_level>(
+				&mut underliers,
+			);
+
+			Self {
+				data: bytemuck::must_cast(data),
+			}
+		}
+
+		#[inline]
+		fn from_scalars(scalars: impl IntoIterator<Item = Self::Scalar>) -> Self {
+			type TransposePacked =
+				<<$packed_storage as WithUnderlier>::Underlier as PackScalar<$scalar_type>>::Packed;
+
+			let mut data = [TransposePacked::default(); Self::HEIGHT_BYTES];
+			let mut iter = scalars.into_iter();
+			for v in data.iter_mut() {
+				*v = TransposePacked::from_scalars(&mut iter);
+			}
+
+			let mut underliers = WithUnderlier::to_underliers_arr_ref_mut(&mut data);
+			UnderlierWithBitOps::transpose_bytes_to_byte_sliced::<$storage_tower_level>(
+				&mut underliers,
+			);
+
+			Self {
+				data: bytemuck::must_cast(data),
+			}
+		}
+	};
+}
+
+macro_rules! byte_sliced_common {
+	($name:ident, $packed_storage:ty, $scalar_type:ty, $storage_level:ty) => {
 		impl Add<$scalar_type> for $name {
 			type Output = Self;
 
@@ -346,32 +455,6 @@ macro_rules! define_byte_sliced_3d {
 			#[inline]
 			fn mul_assign(&mut self, rhs: $scalar_type) {
 				*self *= Self::broadcast(rhs);
-			}
-		}
-
-		impl Add for $name {
-			type Output = Self;
-
-			#[inline]
-			fn add(self, rhs: Self) -> Self {
-				Self {
-					data: array::from_fn(|byte_number| {
-						array::from_fn(|column|
-							self.data[byte_number][column] + rhs.data[byte_number][column]
-						)
-					}),
-				}
-			}
-		}
-
-		impl AddAssign for $name {
-			#[inline]
-			fn add_assign(&mut self, rhs: Self) {
-				for (data, rhs) in zip(&mut self.data, &rhs.data) {
-					for (data, rhs) in zip(data, rhs) {
-						*data += *rhs
-					}
-				}
 			}
 		}
 
@@ -429,97 +512,330 @@ macro_rules! define_byte_sliced_3d {
 			}
 		}
 
-		impl PackedExtension<$scalar_type> for $name {
-			type PackedSubfield = Self;
+		unsafe impl WithUnderlier for $name {
+			type Underlier = ByteSlicedUnderlier<
+				<$packed_storage as WithUnderlier>::Underlier,
+				{ <$storage_level as TowerLevel>::WIDTH },
+			>;
 
 			#[inline(always)]
-			fn cast_bases(packed: &[Self]) -> &[Self::PackedSubfield] {
-				packed
+			fn to_underlier(self) -> Self::Underlier {
+				bytemuck::must_cast(self)
 			}
 
 			#[inline(always)]
-			fn cast_bases_mut(packed: &mut [Self]) -> &mut [Self::PackedSubfield] {
-				packed
+			fn to_underlier_ref(&self) -> &Self::Underlier {
+				bytemuck::must_cast_ref(self)
 			}
 
 			#[inline(always)]
-			fn cast_exts(packed: &[Self::PackedSubfield]) -> &[Self] {
-				packed
+			fn to_underlier_ref_mut(&mut self) -> &mut Self::Underlier {
+				bytemuck::must_cast_mut(self)
 			}
 
 			#[inline(always)]
-			fn cast_exts_mut(packed: &mut [Self::PackedSubfield]) -> &mut [Self] {
-				packed
+			fn to_underliers_ref(val: &[Self]) -> &[Self::Underlier] {
+				bytemuck::must_cast_slice(val)
 			}
 
 			#[inline(always)]
-			fn cast_base(self) -> Self::PackedSubfield {
-				self
+			fn to_underliers_ref_mut(val: &mut [Self]) -> &mut [Self::Underlier] {
+				bytemuck::must_cast_slice_mut(val)
 			}
 
 			#[inline(always)]
-			fn cast_base_ref(&self) -> &Self::PackedSubfield {
-				self
+			fn from_underlier(val: Self::Underlier) -> Self {
+				bytemuck::must_cast(val)
 			}
 
 			#[inline(always)]
-			fn cast_base_mut(&mut self) -> &mut Self::PackedSubfield {
-				self
+			fn from_underlier_ref(val: &Self::Underlier) -> &Self {
+				bytemuck::must_cast_ref(val)
 			}
 
 			#[inline(always)]
-			fn cast_ext(base: Self::PackedSubfield) -> Self {
-				base
+			fn from_underlier_ref_mut(val: &mut Self::Underlier) -> &mut Self {
+				bytemuck::must_cast_mut(val)
 			}
 
 			#[inline(always)]
-			fn cast_ext_ref(base: &Self::PackedSubfield) -> &Self {
-				base
+			fn from_underliers_ref(val: &[Self::Underlier]) -> &[Self] {
+				bytemuck::must_cast_slice(val)
 			}
 
 			#[inline(always)]
-			fn cast_ext_mut(base: &mut Self::PackedSubfield) -> &mut Self {
-				base
+			fn from_underliers_ref_mut(val: &mut [Self::Underlier]) -> &mut [Self] {
+				bytemuck::must_cast_slice_mut(val)
 			}
 		}
 
-		impl<Inner: Transformation<$packed_storage, $packed_storage>> Transformation<$name, $name> for TransformationWrapperNxN<Inner, {<$scalar_tower_level as TowerLevel>::WIDTH}> {
-			fn transform(&self, data: &$name) -> $name {
-				let mut result = <$name>::default();
+		impl PackScalar<$scalar_type>
+			for ByteSlicedUnderlier<
+				<$packed_storage as WithUnderlier>::Underlier,
+				{ <$storage_level as TowerLevel>::WIDTH },
+			>
+		{
+			type Packed = $name;
+		}
+	};
+}
 
-				for row in 0..<$name>::SCALAR_BYTES {
-					for col in 0..<$name>::SCALAR_BYTES {
-						let transformation = &self.0[col][row];
+/// Special case: byte-sliced packed 1b-fields. The order of bytes in the layout matches the one
+/// for a byte-sliced AES field, each byte contains 1b-scalar elements in the natural order.
+macro_rules! define_byte_sliced_3d_1b {
+	($name:ident, $packed_storage:ty, $storage_tower_level: ty) => {
+		#[derive(Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+		#[repr(transparent)]
+		pub struct $name {
+			pub(super) data: [$packed_storage; <$storage_tower_level>::WIDTH],
+		}
 
-						for i in 0..<$name>::HEIGHT {
-							result.data[i][row] += transformation.transform(&data.data[i][col]);
-						}
-					}
+		impl $name {
+			pub const BYTES: usize =
+				<$storage_tower_level as TowerLevel>::WIDTH * <$packed_storage>::WIDTH;
+
+			pub(crate) const HEIGHT_BYTES: usize = <$storage_tower_level as TowerLevel>::WIDTH;
+			const LOG_HEIGHT: usize = checked_log_2(Self::HEIGHT_BYTES);
+
+			/// Get the byte at the given index.
+			///
+			/// # Safety
+			/// The caller must ensure that `byte_index` is less than `BYTES`.
+			#[allow(clippy::modulo_one)]
+			#[inline(always)]
+			pub unsafe fn get_byte_unchecked(&self, byte_index: usize) -> u8 {
+				type Packed8b =
+					PackedType<<$packed_storage as WithUnderlier>::Underlier, AESTowerField8b>;
+
+				Packed8b::cast_ext_ref(self.data.get_unchecked(byte_index % Self::HEIGHT_BYTES))
+					.get_unchecked(byte_index / Self::HEIGHT_BYTES)
+					.to_underlier()
+			}
+
+			/// Convert the byte-sliced field to an array of "ordinary" packed fields preserving the order of scalars.
+			#[inline]
+			pub fn transpose_to(
+				&self,
+				out: &mut [PackedType<<$packed_storage as WithUnderlier>::Underlier, BinaryField1b>;
+					     Self::HEIGHT_BYTES],
+			) {
+				let underliers = WithUnderlier::to_underliers_arr_ref_mut(out);
+				*underliers = WithUnderlier::to_underliers_arr(self.data);
+
+				UnderlierWithBitOps::transpose_bytes_from_byte_sliced::<$storage_tower_level>(
+					underliers,
+				);
+			}
+
+			/// Convert an array of "ordinary" packed fields to a byte-sliced field preserving the order of scalars.
+			#[inline]
+			pub fn transpose_from(
+				underliers: &[PackedType<<$packed_storage as WithUnderlier>::Underlier, BinaryField1b>;
+					 Self::HEIGHT_BYTES],
+			) -> Self {
+				let mut underliers = WithUnderlier::to_underliers_arr(*underliers);
+
+				<$packed_storage as WithUnderlier>::Underlier::transpose_bytes_to_byte_sliced::<
+					$storage_tower_level,
+				>(&mut underliers);
+
+				Self {
+					data: WithUnderlier::from_underliers_arr(underliers),
 				}
-
-				result
 			}
 		}
+
+		impl Default for $name {
+			fn default() -> Self {
+				Self {
+					data: bytemuck::Zeroable::zeroed(),
+				}
+			}
+		}
+
+		impl Debug for $name {
+			fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+				let values_str = self
+					.iter()
+					.map(|value| format!("{}", value))
+					.collect::<Vec<_>>()
+					.join(",");
+
+				write!(f, "ByteSlicedAES{}x1b([{}])", Self::WIDTH, values_str)
+			}
+		}
+
+		impl PackedField for $name {
+			type Scalar = BinaryField1b;
+
+			const LOG_WIDTH: usize = <$packed_storage>::LOG_WIDTH + Self::LOG_HEIGHT;
+
+			#[allow(clippy::modulo_one)]
+			#[inline(always)]
+			unsafe fn get_unchecked(&self, i: usize) -> Self::Scalar {
+				self.data
+					.get_unchecked((i / 8) % Self::HEIGHT_BYTES)
+					.get_unchecked(8 * (i / (Self::HEIGHT_BYTES * 8)) + i % 8)
+			}
+
+			#[allow(clippy::modulo_one)]
+			#[inline(always)]
+			unsafe fn set_unchecked(&mut self, i: usize, scalar: Self::Scalar) {
+				self.data
+					.get_unchecked_mut((i / 8) % Self::HEIGHT_BYTES)
+					.set_unchecked(8 * (i / (Self::HEIGHT_BYTES * 8)) + i % 8, scalar);
+			}
+
+			fn random(mut rng: impl rand::RngCore) -> Self {
+				let data = array::from_fn(|_| <$packed_storage>::random(&mut rng));
+				Self { data }
+			}
+
+			impl_init_with_transpose!($packed_storage, BinaryField1b, $storage_tower_level);
+
+			// Benchmarks show that transposing before the iteration makes it slower for 1b case,
+			// so do not override the default implementations of `iter` and `into_iter`.
+
+			#[allow(unreachable_patterns)]
+			#[inline]
+			fn broadcast(scalar: Self::Scalar) -> Self {
+				let underlier = <$packed_storage as WithUnderlier>::Underlier::fill_with_bit(
+					scalar.to_underlier().into(),
+				);
+				Self {
+					data: array::from_fn(|_| WithUnderlier::from_underlier(underlier)),
+				}
+			}
+
+			#[inline]
+			fn square(self) -> Self {
+				let data = array::from_fn(|i| self.data[i].clone().square());
+				Self { data }
+			}
+
+			#[inline]
+			fn invert_or_zero(self) -> Self {
+				let data = array::from_fn(|i| self.data[i].clone().invert_or_zero());
+				Self { data }
+			}
+
+			#[inline(always)]
+			fn interleave(self, other: Self, log_block_len: usize) -> (Self, Self) {
+				type Packed8b =
+					PackedType<<$packed_storage as WithUnderlier>::Underlier, AESTowerField8b>;
+
+				if log_block_len < 3 {
+					let mut result1 = Self::default();
+					let mut result2 = Self::default();
+
+					for i in 0..Self::HEIGHT_BYTES {
+						(result1.data[i], result2.data[i]) =
+							self.data[i].interleave(other.data[i], log_block_len);
+					}
+
+					(result1, result2)
+				} else {
+					let self_data: &[Packed8b; Self::HEIGHT_BYTES] =
+						Packed8b::cast_ext_arr_ref(&self.data);
+					let other_data: &[Packed8b; Self::HEIGHT_BYTES] =
+						Packed8b::cast_ext_arr_ref(&other.data);
+
+					let (result1, result2) =
+						interleave_byte_sliced(self_data, other_data, log_block_len - 3);
+
+					(
+						Self {
+							data: Packed8b::cast_base_arr(result1),
+						},
+						Self {
+							data: Packed8b::cast_base_arr(result2),
+						},
+					)
+				}
+			}
+
+			#[inline]
+			fn unzip(self, other: Self, log_block_len: usize) -> (Self, Self) {
+				if log_block_len < 3 {
+					let mut result1 = Self::default();
+					let mut result2 = Self::default();
+
+					for i in 0..Self::HEIGHT_BYTES {
+						(result1.data[i], result2.data[i]) =
+							self.data[i].unzip(other.data[i], log_block_len);
+					}
+
+					(result1, result2)
+				} else {
+					type Packed8b =
+						PackedType<<$packed_storage as WithUnderlier>::Underlier, AESTowerField8b>;
+
+					let self_data: &[Packed8b; Self::HEIGHT_BYTES] =
+						Packed8b::cast_ext_arr_ref(&self.data);
+					let other_data: &[Packed8b; Self::HEIGHT_BYTES] =
+						Packed8b::cast_ext_arr_ref(&other.data);
+
+					let (result1, result2) = unzip_byte_sliced::<Packed8b, { Self::HEIGHT_BYTES }, 1>(
+						self_data,
+						other_data,
+						log_block_len - 3,
+					);
+
+					(
+						Self {
+							data: Packed8b::cast_base_arr(result1),
+						},
+						Self {
+							data: Packed8b::cast_base_arr(result2),
+						},
+					)
+				}
+			}
+		}
+
+		impl Mul for $name {
+			type Output = Self;
+
+			#[inline]
+			fn mul(self, rhs: Self) -> Self {
+				Self {
+					data: array::from_fn(|i| self.data[i].clone() * rhs.data[i].clone()),
+				}
+			}
+		}
+
+		impl Add for $name {
+			type Output = Self;
+
+			#[inline]
+			fn add(self, rhs: Self) -> Self {
+				Self {
+					data: array::from_fn(|byte_number| {
+						self.data[byte_number] + rhs.data[byte_number]
+					}),
+				}
+			}
+		}
+
+		impl AddAssign for $name {
+			#[inline]
+			fn add_assign(&mut self, rhs: Self) {
+				for (data, rhs) in zip(&mut self.data, &rhs.data) {
+					*data += *rhs
+				}
+			}
+		}
+
+		byte_sliced_common!($name, $packed_storage, BinaryField1b, $storage_tower_level);
 
 		impl PackedTransformationFactory<$name> for $name {
-			type PackedTransformation<Data: AsRef<[<$name as PackedField>::Scalar]> + Sync> = TransformationWrapperNxN<<$packed_storage as  PackedTransformationFactory<$packed_storage>>::PackedTransformation::<[AESTowerField8b; 8]>, {<$scalar_tower_level as TowerLevel>::WIDTH}>;
+			type PackedTransformation<Data: AsRef<[<$name as PackedField>::Scalar]> + Sync> =
+				IDTransformation;
 
 			fn make_packed_transformation<Data: AsRef<[<$name as PackedField>::Scalar]> + Sync>(
-				transformation: FieldLinearTransformation<<$name as PackedField>::Scalar, Data>,
+				_transformation: FieldLinearTransformation<<$name as PackedField>::Scalar, Data>,
 			) -> Self::PackedTransformation<Data> {
-				let transformations_8b = array::from_fn(|row| {
-					array::from_fn(|col| {
-						let row = row * 8;
-						let linear_transformation_8b = array::from_fn::<_, 8, _>(|row_8b| unsafe {
-							<<$name as PackedField>::Scalar as ExtensionField<AESTowerField8b>>::get_base_unchecked(&transformation.bases()[row + row_8b], col)
-						});
-
-						<$packed_storage as PackedTransformationFactory<$packed_storage
-						>>::make_packed_transformation(FieldLinearTransformation::new(linear_transformation_8b))
-					})
-				});
-
-				TransformationWrapperNxN(transformations_8b)
+				IDTransformation
 			}
 		}
 	};
@@ -574,6 +890,41 @@ fn interleave_byte_sliced<P: PackedField, const N: usize>(
 		3 => interleave_internal_block::<P, N, 3>(lhs, rhs),
 		_ => unreachable!(),
 	}
+}
+
+#[inline(always)]
+fn unzip_byte_sliced<P: PackedField, const N: usize, const SCALAR_BYTES: usize>(
+	lhs: &[P; N],
+	rhs: &[P; N],
+	log_block_len: usize,
+) -> ([P; N], [P; N]) {
+	let mut result1: [P; N] = bytemuck::Zeroable::zeroed();
+	let mut result2: [P; N] = bytemuck::Zeroable::zeroed();
+
+	let log_height = checked_log_2(N);
+	if log_block_len < log_height {
+		let block_size = 1 << log_block_len;
+		let half = N / 2;
+		for block_offset in (0..half).step_by(block_size) {
+			let target_offset = block_offset * 2;
+
+			result1[block_offset..block_offset + block_size]
+				.copy_from_slice(&lhs[target_offset..target_offset + block_size]);
+			result1[half + target_offset..half + target_offset + block_size]
+				.copy_from_slice(&rhs[target_offset..target_offset + block_size]);
+
+			result2[block_offset..block_offset + block_size]
+				.copy_from_slice(&lhs[target_offset + block_size..target_offset + 2 * block_size]);
+			result2[half + target_offset..half + target_offset + block_size]
+				.copy_from_slice(&rhs[target_offset + block_size..target_offset + 2 * block_size]);
+		}
+	} else {
+		for i in 0..N {
+			(result1[i], result2[i]) = lhs[i].unzip(rhs[i], log_block_len - log_height);
+		}
+	}
+
+	(result1, result2)
 }
 
 #[inline(always)]
@@ -657,6 +1008,12 @@ define_byte_sliced_3d!(
 	TowerLevel16
 );
 
+define_byte_sliced_3d_1b!(ByteSliced16x128x1b, PackedBinaryField128x1b, TowerLevel16);
+define_byte_sliced_3d_1b!(ByteSliced8x128x1b, PackedBinaryField128x1b, TowerLevel8);
+define_byte_sliced_3d_1b!(ByteSliced4x128x1b, PackedBinaryField128x1b, TowerLevel4);
+define_byte_sliced_3d_1b!(ByteSliced2x128x1b, PackedBinaryField128x1b, TowerLevel2);
+define_byte_sliced_3d_1b!(ByteSliced1x128x1b, PackedBinaryField128x1b, TowerLevel1);
+
 // 256 bit
 define_byte_sliced_3d!(
 	ByteSlicedAES32x128b,
@@ -721,6 +1078,12 @@ define_byte_sliced_3d!(
 	TowerLevel1,
 	TowerLevel16
 );
+
+define_byte_sliced_3d_1b!(ByteSliced16x256x1b, PackedBinaryField256x1b, TowerLevel16);
+define_byte_sliced_3d_1b!(ByteSliced8x256x1b, PackedBinaryField256x1b, TowerLevel8);
+define_byte_sliced_3d_1b!(ByteSliced4x256x1b, PackedBinaryField256x1b, TowerLevel4);
+define_byte_sliced_3d_1b!(ByteSliced2x256x1b, PackedBinaryField256x1b, TowerLevel2);
+define_byte_sliced_3d_1b!(ByteSliced1x256x1b, PackedBinaryField256x1b, TowerLevel1);
 
 // 512 bit
 define_byte_sliced_3d!(
@@ -787,85 +1150,8 @@ define_byte_sliced_3d!(
 	TowerLevel16
 );
 
-macro_rules! impl_packed_extension{
-	($packed_ext:ty, $packed_base:ty,) => {
-		impl PackedExtension<<$packed_base as PackedField>::Scalar> for $packed_ext {
-			type PackedSubfield = $packed_base;
-
-			fn cast_bases(packed: &[Self]) -> &[Self::PackedSubfield] {
-				bytemuck::must_cast_slice(packed)
-			}
-
-			fn cast_bases_mut(packed: &mut [Self]) -> &mut [Self::PackedSubfield] {
-				bytemuck::must_cast_slice_mut(packed)
-			}
-
-			fn cast_exts(packed: &[Self::PackedSubfield]) -> &[Self] {
-				bytemuck::must_cast_slice(packed)
-			}
-
-			fn cast_exts_mut(packed: &mut [Self::PackedSubfield]) -> &mut [Self] {
-				bytemuck::must_cast_slice_mut(packed)
-			}
-
-			fn cast_base(self) -> Self::PackedSubfield {
-				bytemuck::must_cast(self)
-			}
-
-			fn cast_base_ref(&self) -> &Self::PackedSubfield {
-				bytemuck::must_cast_ref(self)
-			}
-
-			fn cast_base_mut(&mut self) -> &mut Self::PackedSubfield {
-				bytemuck::must_cast_mut(self)
-			}
-
-			fn cast_ext(base: Self::PackedSubfield) -> Self {
-				bytemuck::must_cast(base)
-			}
-
-			fn cast_ext_ref(base: &Self::PackedSubfield) -> &Self {
-				bytemuck::must_cast_ref(base)
-			}
-
-			fn cast_ext_mut(base: &mut Self::PackedSubfield) -> &mut Self {
-				bytemuck::must_cast_mut(base)
-			}
-		}
-	};
-	(@pairs $head:ty, $next:ty,) => {
-		impl_packed_extension!($head, $next,);
-	};
-	(@pairs $head:ty, $next:ty, $($tail:ty,)*) => {
-		impl_packed_extension!($head, $next,);
-		impl_packed_extension!(@pairs $head, $($tail,)*);
-	};
-	($head:ty, $next:ty, $($tail:ty,)*) => {
-		impl_packed_extension!(@pairs $head, $next, $($tail,)*);
-		impl_packed_extension!($next, $($tail,)*);
-	};
-}
-
-impl_packed_extension!(
-	ByteSlicedAES16x128b,
-	ByteSlicedAES2x16x64b,
-	ByteSlicedAES4x16x32b,
-	ByteSlicedAES8x16x16b,
-	ByteSlicedAES16x16x8b,
-);
-
-impl_packed_extension!(
-	ByteSlicedAES32x128b,
-	ByteSlicedAES2x32x64b,
-	ByteSlicedAES4x32x32b,
-	ByteSlicedAES8x32x16b,
-	ByteSlicedAES16x32x8b,
-);
-
-impl_packed_extension!(
-	ByteSlicedAES64x128b,
-	ByteSlicedAES2x64x64b,
-	ByteSlicedAES4x64x32b,
-	ByteSlicedAES8x64x16b,
-	ByteSlicedAES16x64x8b,
-);
+define_byte_sliced_3d_1b!(ByteSliced16x512x1b, PackedBinaryField512x1b, TowerLevel16);
+define_byte_sliced_3d_1b!(ByteSliced8x512x1b, PackedBinaryField512x1b, TowerLevel8);
+define_byte_sliced_3d_1b!(ByteSliced4x512x1b, PackedBinaryField512x1b, TowerLevel4);
+define_byte_sliced_3d_1b!(ByteSliced2x512x1b, PackedBinaryField512x1b, TowerLevel2);
+define_byte_sliced_3d_1b!(ByteSliced1x512x1b, PackedBinaryField512x1b, TowerLevel1);

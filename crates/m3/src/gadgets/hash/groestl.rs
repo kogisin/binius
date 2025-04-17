@@ -10,18 +10,16 @@ use anyhow::Result;
 use array_util::ArrayExt;
 use binius_core::oracle::ShiftVariant;
 use binius_field::{
-	as_packed_field::{PackScalar, PackedType},
+	ext_basis,
 	linear_transformation::{
 		FieldLinearTransformation, PackedTransformationFactory, Transformation,
 	},
 	packed::{get_packed_slice, len_packed_slice, set_packed_slice},
-	AESTowerField8b, ExtensionField, PackedField,
+	AESTowerField8b, ExtensionField, PackedExtension, PackedField, PackedFieldIndexable,
+	PackedSubfield, TowerField,
 };
-use bytemuck::Pod;
 
-use crate::builder::{
-	upcast_col, upcast_expr, Col, Expr, TableBuilder, TableWitnessIndexSegment, B1, B8,
-};
+use crate::builder::{upcast_col, Col, Expr, TableBuilder, TableWitnessSegment, B1, B128, B8};
 
 /// The first row of the circulant matrix defining the MixBytes step in Grøstl.
 const MIX_BYTES_VEC: [u8; 8] = [0x02, 0x02, 0x03, 0x04, 0x05, 0x03, 0x05, 0x07];
@@ -88,10 +86,10 @@ impl Permutation {
 		self.rounds[9].state_out
 	}
 
-	pub fn populate<U>(&self, index: &mut TableWitnessIndexSegment<U>) -> Result<()>
+	pub fn populate<P>(&self, index: &mut TableWitnessSegment<P>) -> Result<()>
 	where
-		U: Pod + PackScalar<B1> + PackScalar<B8>,
-		PackedType<U, B8>: PackedTransformationFactory<PackedType<U, B8>>,
+		P: PackedFieldIndexable<Scalar = B128> + PackedExtension<B1> + PackedExtension<B8>,
+		PackedSubfield<P, B8>: PackedTransformationFactory<PackedSubfield<P, B8>>,
 	{
 		for round in &self.rounds {
 			round.populate(index)?;
@@ -100,13 +98,14 @@ impl Permutation {
 	}
 
 	/// Populate the input column of the witness with a full permutation state.
-	pub fn populate_state_in<'a, U>(
+	pub fn populate_state_in<'a, P>(
 		&self,
-		index: &mut TableWitnessIndexSegment<U>,
+		index: &mut TableWitnessSegment<P>,
 		states: impl IntoIterator<Item = &'a [B8; 64]>,
 	) -> Result<()>
 	where
-		U: PackScalar<B8>,
+		P: PackedExtension<B8>,
+		P::Scalar: TowerField,
 	{
 		let mut state_in = self
 			.state_in()
@@ -124,12 +123,13 @@ impl Permutation {
 	/// Reads the state outputs from the witness index.
 	///
 	/// This is currently only used for testing.
-	pub fn read_state_outs<'a, U>(
+	pub fn read_state_outs<'a, P>(
 		&'a self,
-		index: &'a mut TableWitnessIndexSegment<'a, U>,
+		index: &'a mut TableWitnessSegment<'a, P>,
 	) -> Result<impl Iterator<Item = [B8; 64]> + 'a>
 	where
-		U: PackScalar<B8>,
+		P: PackedExtension<B8>,
+		P::Scalar: TowerField,
 	{
 		let state_out = self
 			.state_out()
@@ -253,10 +253,10 @@ impl PermutationRound {
 		}
 	}
 
-	pub fn populate<U>(&self, index: &mut TableWitnessIndexSegment<U>) -> Result<()>
+	pub fn populate<P>(&self, index: &mut TableWitnessSegment<P>) -> Result<()>
 	where
-		U: Pod + PackScalar<B1> + PackScalar<B8>,
-		PackedType<U, B8>: PackedTransformationFactory<PackedType<U, B8>>,
+		P: PackedFieldIndexable<Scalar = B128> + PackedExtension<B1> + PackedExtension<B8>,
+		PackedSubfield<P, B8>: PackedTransformationFactory<PackedSubfield<P, B8>>,
 	{
 		{
 			let mut round_const = index.get_mut(self.round_const)?;
@@ -326,19 +326,8 @@ struct SBox<const V: usize> {
 
 impl<const V: usize> SBox<V> {
 	pub fn new(table: &mut TableBuilder, input: Expr<B8, V>) -> Self {
-		let b8_basis: [_; 8] = array::from_fn(|i| {
-			<B8 as ExtensionField<B1>>::basis(i).expect("i in range 0..8; extension degree is 8")
-		});
-		let pack_b8 = move |bits: [Expr<B1, V>; 8]| {
-			bits.into_iter()
-				.enumerate()
-				.map(|(i, bit)| upcast_expr(bit) * b8_basis[i])
-				.reduce(|a, b| a + b)
-				.expect("bits has length 8")
-		};
-
 		let inv_bits = array::from_fn(|i| table.add_committed(format!("inv_bits[{}]", i)));
-		let inv = table.add_computed("inv", pack_b8(inv_bits.map(Expr::from)));
+		let inv = table.add_computed("inv", pack_b8(inv_bits));
 
 		// input * inv == 1 OR inv == 0
 		table.assert_zero("inv_valid_or_inv_zero", input.clone() * Expr::from(inv).pow(2) - inv);
@@ -361,10 +350,10 @@ impl<const V: usize> SBox<V> {
 		}
 	}
 
-	pub fn populate<U>(&self, index: &mut TableWitnessIndexSegment<U>) -> Result<()>
+	pub fn populate<P>(&self, index: &mut TableWitnessSegment<P>) -> Result<()>
 	where
-		U: Pod + PackScalar<B1> + PackScalar<B8>,
-		PackedType<U, B8>: PackedTransformationFactory<PackedType<U, B8>>,
+		P: PackedField<Scalar = B128> + PackedExtension<B1> + PackedExtension<B8>,
+		PackedSubfield<P, B8>: PackedTransformationFactory<PackedSubfield<P, B8>>,
 	{
 		let mut inv = index.get_mut(self.inv)?;
 
@@ -387,8 +376,9 @@ impl<const V: usize> SBox<V> {
 		// Apply the F2-linear transformation and populate the output.
 		let mut output = index.get_mut(self.output)?;
 
-		let transform_matrix = <PackedType<U, B8>>::make_packed_transformation(S_BOX_TOWER_MATRIX);
-		let transform_offset = <PackedType<U, B8>>::broadcast(S_BOX_TOWER_OFFSET);
+		let transform_matrix =
+			<PackedSubfield<P, B8>>::make_packed_transformation(S_BOX_TOWER_MATRIX);
+		let transform_offset = <PackedSubfield<P, B8>>::broadcast(S_BOX_TOWER_OFFSET);
 		for (out_i, inv_i) in iter::zip(&mut *output, &*inv) {
 			*out_i = transform_offset + transform_matrix.transform(inv_i);
 		}
@@ -397,17 +387,28 @@ impl<const V: usize> SBox<V> {
 	}
 }
 
+fn pack_b8<const V: usize>(bits: [Col<B1, V>; 8]) -> Expr<B8, V> {
+	let b8_basis: [_; 8] = array::from_fn(ext_basis::<B8, B1>);
+	bits.into_iter()
+		.enumerate()
+		.map(|(i, bit)| upcast_col(bit) * b8_basis[i])
+		.reduce(|a, b| a + b)
+		.expect("bits has length 8")
+}
+
 #[cfg(test)]
 mod tests {
 	use std::iter::repeat_with;
 
-	use binius_field::{arch::OptimalUnderlier128b, arithmetic_traits::InvertOrZero};
+	use binius_field::{
+		arch::OptimalUnderlier128b, arithmetic_traits::InvertOrZero, as_packed_field::PackedType,
+	};
 	use binius_hash::groestl::{GroestlShortImpl, GroestlShortInternal};
 	use bumpalo::Bump;
 	use rand::{prelude::StdRng, SeedableRng};
 
 	use super::*;
-	use crate::builder::{ConstraintSystem, Statement};
+	use crate::builder::{ConstraintSystem, Statement, WitnessIndex};
 
 	#[test]
 	fn test_sbox() {
@@ -425,11 +426,10 @@ mod tests {
 			boundaries: vec![],
 			table_sizes: vec![1 << 8],
 		};
-		let mut witness = cs
-			.build_witness::<OptimalUnderlier128b>(&allocator, &statement)
-			.unwrap();
+		let mut witness =
+			WitnessIndex::<PackedType<OptimalUnderlier128b, B128>>::new(&cs, &allocator);
 
-		let table_witness = witness.get_table(table_id).unwrap();
+		let table_witness = witness.init_table(table_id, 1 << 8).unwrap();
 
 		let mut rng = StdRng::seed_from_u64(0);
 		let mut segment = table_witness.full_segment();
@@ -440,7 +440,7 @@ mod tests {
 		sbox.populate(&mut segment).unwrap();
 
 		let ccs = cs.compile(&statement).unwrap();
-		let witness = witness.into_multilinear_extension_index(&statement);
+		let witness = witness.into_multilinear_extension_index();
 
 		binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness).unwrap();
 	}
@@ -461,11 +461,10 @@ mod tests {
 			boundaries: vec![],
 			table_sizes: vec![1 << 8],
 		};
-		let mut witness = cs
-			.build_witness::<OptimalUnderlier128b>(&allocator, &statement)
-			.unwrap();
+		let mut witness =
+			WitnessIndex::<PackedType<OptimalUnderlier128b, B128>>::new(&cs, &allocator);
 
-		let table_witness = witness.get_table(table_id).unwrap();
+		let table_witness = witness.init_table(table_id, 1 << 8).unwrap();
 
 		let mut rng = StdRng::seed_from_u64(0);
 		let in_states = repeat_with(|| array::from_fn::<_, 64, _>(|_| B8::random(&mut rng)))
@@ -494,7 +493,7 @@ mod tests {
 		}
 
 		let ccs = cs.compile(&statement).unwrap();
-		let witness = witness.into_multilinear_extension_index(&statement);
+		let witness = witness.into_multilinear_extension_index();
 
 		binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness).unwrap();
 	}
@@ -515,11 +514,10 @@ mod tests {
 			boundaries: vec![],
 			table_sizes: vec![1 << 8],
 		};
-		let mut witness = cs
-			.build_witness::<OptimalUnderlier128b>(&allocator, &statement)
-			.unwrap();
+		let mut witness =
+			WitnessIndex::<PackedType<OptimalUnderlier128b, B128>>::new(&cs, &allocator);
 
-		let table_witness = witness.get_table(table_id).unwrap();
+		let table_witness = witness.init_table(table_id, 1 << 8).unwrap();
 
 		let mut rng = StdRng::seed_from_u64(0);
 		let in_states = repeat_with(|| array::from_fn::<_, 64, _>(|_| B8::random(&mut rng)))
@@ -548,7 +546,7 @@ mod tests {
 		}
 
 		let ccs = cs.compile(&statement).unwrap();
-		let witness = witness.into_multilinear_extension_index(&statement);
+		let witness = witness.into_multilinear_extension_index();
 
 		binius_core::constraint_system::validate::validate_witness(&ccs, &[], &witness).unwrap();
 	}

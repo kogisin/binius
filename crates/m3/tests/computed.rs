@@ -1,13 +1,15 @@
 // Copyright 2025 Irreducible Inc.
 
 use binius_core::{fiat_shamir::HasherChallenger, tower::CanonicalTowerFamily};
-use binius_field::{arch::OptimalUnderlier128b, as_packed_field::PackScalar, Field};
+use binius_field::{
+	arch::OptimalUnderlier128b, as_packed_field::PackedType, Field, PackedExtension,
+	PackedFieldIndexable,
+};
 use binius_hash::groestl::{Groestl256, Groestl256ByteCompression};
 use binius_m3::builder::{
-	Col, ConstraintSystem, Statement, TableFiller, TableId, TableWitnessIndexSegment, B1, B128, B64,
+	Col, ConstraintSystem, Statement, TableFiller, TableId, TableWitnessSegment, WitnessIndex, B128,
 };
 use bumpalo::Bump;
-use bytemuck::Pod;
 
 const VALUES_PER_ROW: usize = 32;
 const N_ROWS: usize = 8;
@@ -18,8 +20,6 @@ pub struct MyTable {
 	id: TableId,
 	committed_1: Col<B128, VALUES_PER_ROW>,
 	committed_2: Col<B128, VALUES_PER_ROW>,
-	_zeros_1: [Col<B64, 16>; 10],
-	_zeros_2: [Col<B64, 64>; 10],
 	computed: Col<B128, VALUES_PER_ROW>,
 }
 
@@ -27,31 +27,25 @@ impl MyTable {
 	pub fn new(cs: &mut ConstraintSystem) -> Self {
 		let mut table = cs.add_table("table_1");
 		let committed_1 = table.add_committed::<B128, VALUES_PER_ROW>("committed_2");
-		let zeros_1 = table.add_committed_multiple::<B64, 16, 10>("col_zeros_1");
 		let committed_2 = table.add_committed::<B128, VALUES_PER_ROW>("committed_2");
-		let zeros_2 = table.add_committed_multiple::<B64, 64, 10>("col_zeros_2");
 		let expr = (committed_1 + committed_2) * committed_1 * B128::from(10) + B128::ONE;
-		let computed = table.add_computed("computed", expr);
-		for col in &zeros_1 {
-			table.assert_zero("zeros_1", (*col).into());
-		}
-		for col in &zeros_2 {
-			table.assert_zero("zeros_2", (*col).into());
-		}
+		let computed = table.add_computed("computed", expr.clone());
+
+		// Test that the computed column equals the composite evaluation over the table.
+		table.assert_zero("computed = expr", expr - computed);
+
 		Self {
 			id: table.id(),
 			committed_1,
 			committed_2,
 			computed,
-			_zeros_1: zeros_1,
-			_zeros_2: zeros_2,
 		}
 	}
 }
 
-impl<U> TableFiller<U> for MyTable
+impl<P> TableFiller<P> for MyTable
 where
-	U: Pod + PackScalar<B1>,
+	P: PackedFieldIndexable<Scalar = B128> + PackedExtension<B128>,
 {
 	type Event = (u128, u128);
 
@@ -61,21 +55,21 @@ where
 
 	fn fill<'a>(
 		&'a self,
-		mut rows: impl Iterator<Item = &'a Self::Event>,
-		witness: &'a mut TableWitnessIndexSegment<U>,
+		rows: impl Iterator<Item = &'a Self::Event>,
+		witness: &'a mut TableWitnessSegment<P>,
 	) -> Result<(), anyhow::Error> {
 		let mut committed_1 = witness.get_mut_as(self.committed_1)?;
 		let mut committed_2 = witness.get_mut_as(self.committed_2)?;
 		let mut computed = witness.get_mut_as(self.computed)?;
 
-		let &(com1, com2) = rows.next().unwrap();
-		assert!(rows.next().is_none());
-
-		for i in 0..VALUES_PER_ROW {
-			committed_1[i] = com1;
-			committed_2[i] = com2;
-			computed[i] = (B128::from(com1) + B128::from(com2)) * B128::from(com1) * B128::from(10)
-				+ B128::ONE;
+		for (i, &(com1, com2)) in rows.enumerate() {
+			for j in 0..VALUES_PER_ROW {
+				committed_1[i * VALUES_PER_ROW + j] = com1;
+				committed_2[i * VALUES_PER_ROW + j] = com2;
+				computed[i * VALUES_PER_ROW + j] =
+					(B128::from(com1) + B128::from(com2)) * B128::from(com1) * B128::from(10)
+						+ B128::ONE;
+			}
 		}
 		Ok(())
 	}
@@ -86,13 +80,8 @@ fn test_m3_computed_col() {
 	let allocator = Bump::new();
 	let mut cs = ConstraintSystem::<B128>::new();
 	let table = MyTable::new(&mut cs);
-	let statement = Statement {
-		boundaries: vec![],
-		table_sizes: vec![N_ROWS],
-	};
-	let mut witness = cs
-		.build_witness::<OptimalUnderlier128b>(&allocator, &statement)
-		.unwrap();
+
+	let mut witness = WitnessIndex::<PackedType<OptimalUnderlier128b, B128>>::new(&cs, &allocator);
 	witness
 		.fill_table_sequential(
 			&table,
@@ -102,8 +91,12 @@ fn test_m3_computed_col() {
 		)
 		.unwrap();
 
+	let statement = Statement {
+		boundaries: vec![],
+		table_sizes: witness.table_sizes(),
+	};
 	let constraint_system = cs.compile(&statement).unwrap();
-	let witness = witness.into_multilinear_extension_index(&statement);
+	let witness = witness.into_multilinear_extension_index();
 
 	binius_core::constraint_system::validate::validate_witness(
 		&constraint_system,
@@ -113,7 +106,7 @@ fn test_m3_computed_col() {
 	.unwrap();
 
 	let proof = binius_core::constraint_system::prove::<
-		_,
+		OptimalUnderlier128b,
 		CanonicalTowerFamily,
 		Groestl256,
 		Groestl256ByteCompression,

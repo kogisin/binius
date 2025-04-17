@@ -20,16 +20,26 @@ pub enum Error {
 		table_id: TableId,
 		log_vals_per_row: usize,
 	},
+	#[error("cannot construct witness index for empty table {table_id}")]
+	EmptyTable { table_id: TableId },
+	#[error("table {table_id} index has already been initialized")]
+	TableIndexAlreadyInitialized { table_id: TableId },
 	#[error("column is not in table; column table ID: {column_table_id}, witness table ID: {witness_table_id}")]
 	TableMismatch {
 		column_table_id: TableId,
 		witness_table_id: TableId,
 	},
+	#[error("table {table_id} is required to have a power-of-two size, instead got {size}")]
+	TableSizePowerOfTwoRequired { table_id: TableId, size: usize },
 	// TODO: These should have column IDs
 	#[error("witness borrow error: {0}. Note that packed columns are aliases for the unpacked column when accessing witness data")]
 	WitnessBorrow(#[source] BorrowError),
 	#[error("witness borrow error: {0}. Note that packed columns are aliases for the unpacked column when accessing witness data")]
 	WitnessBorrowMut(#[source] BorrowMutError),
+	#[error(
+		"the table index was initialized for {expected} events; attempted to fill with {actual}"
+	)]
+	IncorrectNumberOfTableEvents { expected: usize, actual: usize },
 	#[error("table fill error: {0}")]
 	TableFill(anyhow::Error),
 	#[error("math error: {0}")]

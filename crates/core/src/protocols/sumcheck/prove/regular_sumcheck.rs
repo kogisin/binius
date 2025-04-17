@@ -3,9 +3,10 @@
 use std::{marker::PhantomData, ops::Range};
 
 use binius_field::{ExtensionField, Field, PackedExtension, PackedField, TowerField};
-use binius_hal::{ComputationBackend, SumcheckEvaluator};
+use binius_hal::{ComputationBackend, SumcheckEvaluator, SumcheckMultilinear};
 use binius_math::{
-	CompositionPoly, EvaluationDomainFactory, EvaluationOrder, InterpolationDomain, MultilinearPoly,
+	CompositionPoly, EvaluationDomainFactory, EvaluationOrder, InterpolationDomain,
+	MultilinearPoly, RowsBatchRef,
 };
 use binius_maybe_rayon::prelude::*;
 use binius_utils::bail;
@@ -17,11 +18,11 @@ use crate::{
 	polynomial::{ArithCircuitPoly, Error as PolynomialError, MultilinearComposite},
 	protocols::sumcheck::{
 		common::{
-			get_nontrivial_evaluation_points, interpolation_domains_for_composition_degrees,
-			CompositeSumClaim, RoundCoeffs,
+			equal_n_vars_check, get_nontrivial_evaluation_points,
+			interpolation_domains_for_composition_degrees, CompositeSumClaim, RoundCoeffs,
 		},
 		error::Error,
-		prove::{MultilinearInput, ProverState, SumcheckInterpolator, SumcheckProver},
+		prove::{ProverState, SumcheckInterpolator, SumcheckProver},
 	},
 };
 
@@ -86,7 +87,7 @@ impl<'a, F, FDomain, P, Composition, M, Backend>
 where
 	F: Field,
 	FDomain: Field,
-	P: PackedField<Scalar = F> + PackedExtension<F, PackedSubfield = P> + PackedExtension<FDomain>,
+	P: PackedField<Scalar = F> + PackedExtension<FDomain>,
 	Composition: CompositionPoly<P>,
 	M: MultilinearPoly<P> + Send + Sync,
 	Backend: ComputationBackend,
@@ -100,6 +101,7 @@ where
 		switchover_fn: impl Fn(usize) -> usize,
 		backend: &'a Backend,
 	) -> Result<Self, Error> {
+		let n_vars = equal_n_vars_check(&multilinears)?;
 		let composite_claims = composite_claims.into_iter().collect::<Vec<_>>();
 
 		#[cfg(feature = "debug_validate_sumcheck")]
@@ -142,23 +144,19 @@ where
 
 		let nontrivial_evaluation_points = get_nontrivial_evaluation_points(&domains)?;
 
-		let multilinears_input = multilinears
+		let multilinears = multilinears
 			.into_iter()
-			.map(|multilinear| MultilinearInput {
-				multilinear,
-				zero_scalars_suffix: 0,
-			})
+			.map(|multilinear| SumcheckMultilinear::transparent(multilinear, &switchover_fn))
 			.collect();
 
 		let state = ProverState::new(
 			evaluation_order,
-			multilinears_input,
+			n_vars,
+			multilinears,
 			claimed_sums,
 			nontrivial_evaluation_points,
-			switchover_fn,
 			backend,
 		)?;
-		let n_vars = state.n_vars();
 
 		Ok(Self {
 			n_vars,
@@ -249,9 +247,9 @@ where
 		_subcube_vars: usize,
 		_subcube_index: usize,
 		is_infinity_point: bool,
-		batch_query: &[&[P]],
+		batch_query: &RowsBatchRef<P>,
 	) -> P {
-		let row_len = batch_query.first().map_or(0, |row| row.len());
+		let row_len = batch_query.row_len();
 
 		stackalloc_with_default(row_len, |evals| {
 			if is_infinity_point {
